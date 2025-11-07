@@ -1,0 +1,16 @@
+id: VYT26-0101
+theme: "Horse wreath + winter village + garland"
+grid: "3x3"
+target_size_cm: "90x120"
+dpi: 300
+min_bridge_mm: 1.4
+overlap_mm: 4
+margins_mm: 10
+bg_gray: "#A0A0A0"
+style:
+  threshold: "otsu"      # otsu | adaptive
+  blur_sigma: 0.8
+  simplify_mm: 0.6
+  allow_islands: false
+source:
+  - input/sample.png.xbase64
