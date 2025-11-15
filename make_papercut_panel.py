@@ -110,11 +110,15 @@ class PanelLayout:
 # --------------------------- B/W подготовка ----------------------------
 
 
+DEFAULT_NORMALIZE_BLUR_RADIUS = 0.8
+
+
 @dataclass
 class NormalizationParams:
     target_dpi: int
     upscale_factor: float
-    blur_radius: float
+    base_blur_radius: float
+    blur_mode: str
 
 
 @dataclass
@@ -141,7 +145,7 @@ logger = logging.getLogger("papercut_panel")
 def normalize_source_image(img: Image.Image, params: NormalizationParams) -> Tuple[Image.Image, float]:
     """Return a smoothed copy of the source image ready for mask extraction."""
 
-    if params.upscale_factor <= 1.0 and params.blur_radius <= 0:
+    if params.upscale_factor <= 1.0 and params.base_blur_radius <= 0:
         return img.copy(), 1.0
 
     upscale = max(1.0, float(params.upscale_factor))
@@ -164,8 +168,34 @@ def normalize_source_image(img: Image.Image, params: NormalizationParams) -> Tup
     else:
         working = img.resize((target_w, target_h), resample=Resampling.LANCZOS)
 
-    if params.blur_radius > 0:
-        working = working.filter(ImageFilter.GaussianBlur(radius=params.blur_radius))
+    effective_blur = 0.0
+    base_blur = max(0.0, float(params.base_blur_radius))
+    scale_used = target_w / float(w) if w else 1.0
+
+    if params.blur_mode == "fixed":
+        effective_blur = base_blur
+    elif params.blur_mode == "auto":
+        if scale_used <= 1.01:
+            effective_blur = 0.0
+        else:
+            if params.upscale_factor > 1.0:
+                denom = params.upscale_factor - 1.0
+                if denom > 0:
+                    scale_weight = min(1.0, max((scale_used - 1.0) / denom, 0.0))
+                else:
+                    scale_weight = 1.0
+            else:
+                scale_weight = min(1.0, max(scale_used - 1.0, 0.0))
+            effective_blur = base_blur * scale_weight
+            if dpi and params.target_dpi > 0:
+                src_dpi = max(dpi[0], dpi[1], 1)
+                if src_dpi >= params.target_dpi:
+                    effective_blur *= params.target_dpi / float(src_dpi)
+    else:
+        effective_blur = 0.0
+
+    if effective_blur > 0:
+        working = working.filter(ImageFilter.GaussianBlur(radius=effective_blur))
 
     if (target_w, target_h) != (w, h):
         working = working.resize((w, h), resample=Resampling.LANCZOS)
@@ -658,6 +688,38 @@ def save_pptx_from_tiles(
 # --------------------------- CLI ----------------------------
 
 
+def _interpret_normalize_blur(value: str) -> Tuple[str, float]:
+    raw = "" if value is None else str(value).strip()
+    text = raw.lower()
+
+    if text in {"", "auto", "adaptive"}:
+        return "auto", DEFAULT_NORMALIZE_BLUR_RADIUS
+
+    if text.startswith("auto:") or text.startswith("auto="):
+        _, _, tail = text.partition(":" if ":" in text else "=")
+        try:
+            radius = float(tail)
+        except ValueError as exc:  # pragma: no cover - defensive, CLI validated earlier
+            raise ValueError(f"Invalid --normalize-blur value: {value!r}") from exc
+        if radius < 0:
+            raise ValueError("Normalization blur radius must be non-negative")
+        return "auto", radius
+
+    if text in {"none", "no", "off"}:
+        return "none", 0.0
+
+    try:
+        radius = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid --normalize-blur value: {value!r}") from exc
+
+    if radius < 0:
+        raise ValueError("Normalization blur radius must be non-negative")
+    if radius == 0:
+        return "none", 0.0
+    return "fixed", radius
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Papercut/stencil panel builder (3x4 A4).")
     p.add_argument("input", help="Input image (PNG/JPG).")
@@ -740,9 +802,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--normalize-blur",
-        type=float,
-        default=0.8,
-        help="Gaussian blur radius used during normalization (default: 0.8).",
+        type=str,
+        default="auto",
+        help=(
+            "Normalization blur (default: auto). Use 'auto' for DPI-aware smoothing, "
+            "'auto:1.0' to tweak the base radius, 'none' to skip blur for fragile artwork, "
+            "or a numeric radius for a fixed blur."
+        ),
     )
     p.add_argument(
         "--fit-mode",
@@ -815,10 +881,16 @@ def main(argv=None) -> None:
         margin_mm=args.margin_mm,
     )
 
+    try:
+        blur_mode, blur_radius = _interpret_normalize_blur(args.normalize_blur)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     norm_params = NormalizationParams(
         target_dpi=max(0, int(args.normalize_dpi)),
         upscale_factor=max(1.0, float(args.normalize_scale)),
-        blur_radius=max(0.0, float(args.normalize_blur)),
+        base_blur_radius=blur_radius,
+        blur_mode=blur_mode,
     )
 
     if args.flip_silhouette:
@@ -841,11 +913,17 @@ def main(argv=None) -> None:
     logger.info("Loading image: %s", inp)
     src_loaded = Image.open(inp).convert("RGB")
     src, norm_scale = normalize_source_image(src_loaded, norm_params)
-    if norm_scale > 1.0 or norm_params.blur_radius > 0:
+    if norm_scale > 1.0 or norm_params.blur_mode != "none":
+        if norm_params.blur_mode == "none":
+            blur_desc = "off"
+        elif norm_params.blur_mode == "fixed":
+            blur_desc = f"fixed {norm_params.base_blur_radius:.2f}"
+        else:
+            blur_desc = f"auto {norm_params.base_blur_radius:.2f}"
         logger.info(
-            "Source normalization applied (scale %.2f, blur %.2f)",
+            "Source normalization applied (scale %.2f, blur %s)",
             norm_scale,
-            norm_params.blur_radius,
+            blur_desc,
         )
 
     panel, original_panel, auto_flipped = build_white_on_gray_panel(
