@@ -11,6 +11,20 @@ pushd "%~dp0" >nul 2>&1
 set "PYEXE=python"
 set "SCRIPT=make_papercut_panel.py"
 
+rem Default parameter pack for automated batches
+set "FORMAT=both"
+set "THRESHOLD=200"
+set "DETAIL_DELTA=60"
+set "BLUR=0.6"
+set "DILATE_PX=1"
+set "DETAIL_JOIN_PX=2"
+set "ANTIALIAS_RADIUS=0.8"
+set "NORMALIZE_DPI=300"
+set "NORMALIZE_SCALE=2.0"
+set "NORMALIZE_BLUR=0.8"
+set "NORMALIZE_PRESET=default"
+set "INVERT_MODE=auto"
+
 if not exist "%SCRIPT%" (
     echo [ERR] %SCRIPT% not found next to this batch file.
     popd >nul 2>&1
@@ -34,6 +48,8 @@ if not exist "%ROOT_PATH%" (
 
 echo [INFO] Scanning root: %ROOT_PATH%
 >>"%LOGFILE%" echo [INFO] Scanning root: %ROOT_PATH%
+>>"%LOGFILE%" echo [INFO] DETAIL: THRESH=%THRESHOLD% DELTA=%DETAIL_DELTA% BLUR=%BLUR% DILATE=%DILATE_PX% JOIN=%DETAIL_JOIN_PX% ANTIALIAS=%ANTIALIAS_RADIUS%
+>>"%LOGFILE%" echo [INFO] NORMALIZE: DPI=%NORMALIZE_DPI% SCALE=%NORMALIZE_SCALE% BLUR=%NORMALIZE_BLUR% PRESET=%NORMALIZE_PRESET% INVERT=%INVERT_MODE% FORMAT=%FORMAT%
 
 for /f "usebackq delims=" %%T in (`powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"`) do set "STAMP=%%T"
 set "OUT_ROOT=%ROOT_PATH%\papercut_batch_%STAMP%"
@@ -109,11 +125,11 @@ echo [TASK %ID%] Source: %SRC%
 
 if defined PY_VERSION >>"%LOGFILE%" echo [TASK %ID%] %PY_VERSION%
 
-set "CMDLINE="%PYEXE%" -X utf8 "%SCRIPT%" "%SRC%" --output "%OUTBASE%" --format both --shift-x-mm "0" --shift-y-mm "0" --debug-panel"
+set CMDLINE=%PYEXE% -X utf8 "%SCRIPT%" "%SRC%" --output "%OUTBASE%" --format %FORMAT% --threshold %THRESHOLD% --detail-delta %DETAIL_DELTA% --blur %BLUR% --dilate-px %DILATE_PX% --detail-join-px %DETAIL_JOIN_PX% --antialias-radius %ANTIALIAS_RADIUS% --normalize-dpi %NORMALIZE_DPI% --normalize-scale %NORMALIZE_SCALE% --normalize-blur %NORMALIZE_BLUR% --normalize-preset %NORMALIZE_PRESET% --invert-mode %INVERT_MODE% --shift-x-mm 0 --shift-y-mm 0 --debug-panel
 >>"%LOGFILE%" echo [TASK %ID%] [RUN] %CMDLINE%
 echo [TASK %ID%] [RUN] %CMDLINE%
 
-powershell -NoProfile -Command "& { & '%PYEXE%' -X utf8 '%SCRIPT%' '%SRC%' --output '%OUTBASE%' --format both --shift-x-mm '0' --shift-y-mm '0' --debug-panel 2>&1 | Tee-Object -FilePath '%LOGFILE%' -Append; exit $LASTEXITCODE }"
+powershell -NoProfile -Command "& { & '%PYEXE%' -X utf8 '%SCRIPT%' '%SRC%' --output '%OUTBASE%' --format '%FORMAT%' --threshold '%THRESHOLD%' --detail-delta '%DETAIL_DELTA%' --blur '%BLUR%' --dilate-px '%DILATE_PX%' --detail-join-px '%DETAIL_JOIN_PX%' --antialias-radius '%ANTIALIAS_RADIUS%' --normalize-dpi '%NORMALIZE_DPI%' --normalize-scale '%NORMALIZE_SCALE%' --normalize-blur '%NORMALIZE_BLUR%' --normalize-preset '%NORMALIZE_PRESET%' --invert-mode '%INVERT_MODE%' --shift-x-mm '0' --shift-y-mm '0' --debug-panel 2>&1 | Tee-Object -FilePath '%LOGFILE%' -Append; exit $LASTEXITCODE }"
 set "RC=%ERRORLEVEL%"
 >>"%LOGFILE%" echo [TASK %ID%] [LOG] Exit code: %RC%
 

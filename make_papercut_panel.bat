@@ -7,6 +7,20 @@ pushd "%~dp0" >nul 2>&1
 set "PYEXE=python"
 set "SCRIPT=make_papercut_panel.py"
 
+rem Default parameter set aligned with DoD tuning
+set "FORMAT=pptx"
+set "THRESHOLD=200"
+set "DETAIL_DELTA=60"
+set "BLUR=0.6"
+set "DILATE_PX=1"
+set "DETAIL_JOIN_PX=2"
+set "ANTIALIAS_RADIUS=0.8"
+set "NORMALIZE_DPI=300"
+set "NORMALIZE_SCALE=2.0"
+set "NORMALIZE_BLUR=0.8"
+set "NORMALIZE_PRESET=default"
+set "INVERT_MODE=auto"
+
 if not exist "%SCRIPT%" (
     echo [ERR] %SCRIPT% not found next to this batch file.
     popd >nul 2>&1
@@ -67,18 +81,22 @@ if "%SHIFT_Y_MM%"=="" set "SHIFT_Y_MM=0"
 for /f "tokens=*" %%A in ("!SHIFT_Y_MM!") do set "SHIFT_Y_MM=%%A"
 
 >>"%LOGFILE%" echo [CFG] INPUT="!INPUT_FULL!" OUTBASE="!OUTBASE_FULL!" SHIFT=!SHIFT_X_MM!x!SHIFT_Y_MM!mm
+>>"%LOGFILE%" echo [CFG] THRESH=%THRESHOLD% DETAIL_DELTA=%DETAIL_DELTA% BLUR=%BLUR% DILATE=%DILATE_PX% DETAIL_JOIN=%DETAIL_JOIN_PX% ANTIALIAS=%ANTIALIAS_RADIUS%
+>>"%LOGFILE%" echo [CFG] NORMALIZE_DPI=%NORMALIZE_DPI% SCALE=%NORMALIZE_SCALE% BLUR=%NORMALIZE_BLUR% PRESET=%NORMALIZE_PRESET% INVERT=%INVERT_MODE% FORMAT=%FORMAT%
 echo [CFG] INPUT="!INPUT_FULL!" OUTBASE="!OUTBASE_FULL!" SHIFT=!SHIFT_X_MM!x!SHIFT_Y_MM!mm
+echo [CFG] DETAIL: threshold=%THRESHOLD% delta=%DETAIL_DELTA% blur=%BLUR% dilate=%DILATE_PX% join=%DETAIL_JOIN_PX% antialias=%ANTIALIAS_RADIUS%
+echo [CFG] NORMALIZE: dpi=%NORMALIZE_DPI% scale=%NORMALIZE_SCALE% blur=%NORMALIZE_BLUR% preset=%NORMALIZE_PRESET% invert=%INVERT_MODE% format=%FORMAT%
 
 for /f "delims=" %%V in ('"%PYEXE%" -V 2^>^&1') do (
     echo %%V
     >>"%LOGFILE%" echo %%V
 )
 
-set "CMDLINE="%PYEXE%" -X utf8 "%SCRIPT%" "!INPUT_FULL!" --output "!OUTBASE_FULL!" --shift-x-mm "!SHIFT_X_MM!" --shift-y-mm "!SHIFT_Y_MM!""
+set CMDLINE=%PYEXE% -X utf8 "%SCRIPT%" "!INPUT_FULL!" --output "!OUTBASE_FULL!" --format %FORMAT% --threshold %THRESHOLD% --detail-delta %DETAIL_DELTA% --blur %BLUR% --dilate-px %DILATE_PX% --detail-join-px %DETAIL_JOIN_PX% --antialias-radius %ANTIALIAS_RADIUS% --normalize-dpi %NORMALIZE_DPI% --normalize-scale %NORMALIZE_SCALE% --normalize-blur %NORMALIZE_BLUR% --normalize-preset %NORMALIZE_PRESET% --invert-mode %INVERT_MODE% --shift-x-mm !SHIFT_X_MM! --shift-y-mm !SHIFT_Y_MM!
 echo [RUN] %CMDLINE%
 >>"%LOGFILE%" echo [RUN] %CMDLINE%
 
-powershell -NoProfile -Command "& { & '%PYEXE%' -X utf8 '%SCRIPT%' '%INPUT_FULL%' --output '%OUTBASE_FULL%' --shift-x-mm '%SHIFT_X_MM%' --shift-y-mm '%SHIFT_Y_MM%' 2>&1 | Tee-Object -FilePath '%LOGFILE%' -Append; exit $LASTEXITCODE }"
+powershell -NoProfile -Command "& { & '%PYEXE%' -X utf8 '%SCRIPT%' '%INPUT_FULL%' --output '%OUTBASE_FULL%' --format '%FORMAT%' --threshold '%THRESHOLD%' --detail-delta '%DETAIL_DELTA%' --blur '%BLUR%' --dilate-px '%DILATE_PX%' --detail-join-px '%DETAIL_JOIN_PX%' --antialias-radius '%ANTIALIAS_RADIUS%' --normalize-dpi '%NORMALIZE_DPI%' --normalize-scale '%NORMALIZE_SCALE%' --normalize-blur '%NORMALIZE_BLUR%' --normalize-preset '%NORMALIZE_PRESET%' --invert-mode '%INVERT_MODE%' --shift-x-mm '%SHIFT_X_MM%' --shift-y-mm '%SHIFT_Y_MM%' 2>&1 | Tee-Object -FilePath '%LOGFILE%' -Append; exit $LASTEXITCODE }"
 set "RC=%ERRORLEVEL%"
 
 >>"%LOGFILE%" echo [LOG] Exit code: %RC%
