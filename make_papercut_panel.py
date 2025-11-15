@@ -377,6 +377,33 @@ def build_masks_from_gray(gray_processed: Image.Image, params: BWParams) -> Mask
     holes_raw = gray_processed.point(lambda g: 255 if g < t_detail else 0, mode="1")
     holes_seed = ImageChops.logical_and(holes_raw, paper_candidate)
 
+    # Relative contrast-based seeding picks enclosed regions that are darker than
+    # their immediate surroundings even if they stay above the absolute
+    # threshold. This helps recover eyes/berries that sit inside brighter paper
+    # areas without punching through the background.
+    local_window = max(3, 2 * max(params.dilate_px, params.detail_join_px, 1) + 1)
+    local_max = gray_processed.filter(ImageFilter.MaxFilter(size=local_window))
+    local_min = gray_processed.filter(ImageFilter.MinFilter(size=local_window))
+    local_contrast = ImageChops.subtract(local_max, local_min)
+    relative_dark = ImageChops.subtract(local_max, gray_processed)
+
+    relative_thresh = max(8, int(round((t_bg - t_detail) * 0.75)))
+    contrast_thresh = max(relative_thresh * 2, 24)
+
+    relative_mask = relative_dark.point(lambda v: 255 if v >= relative_thresh else 0, mode="1")
+    contrast_mask = local_contrast.point(lambda v: 255 if v >= contrast_thresh else 0, mode="1")
+    relative_seed = ImageChops.logical_and(relative_mask, contrast_mask)
+    relative_seed = ImageChops.logical_and(relative_seed, paper_candidate)
+
+    seed_close_radius = 1 if params.detail_join_px > 0 else 0
+    if seed_close_radius > 0:
+        # Gently close thin gaps around the relative seed so it can flow
+        # through the same pipeline as the absolute threshold result without
+        # leaving bright rims around micro-edges.
+        relative_seed = _apply_closing(relative_seed, seed_close_radius)
+
+    holes_seed = ImageChops.logical_or(holes_seed, relative_seed)
+
     hole_close_radius = params.dilate_px if params.dilate_px > 0 else 0
     holes_refined = _apply_closing(holes_seed, hole_close_radius)
 
