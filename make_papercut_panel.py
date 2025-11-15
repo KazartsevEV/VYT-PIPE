@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import List, Tuple
 
@@ -110,15 +111,11 @@ class PanelLayout:
 # --------------------------- B/W подготовка ----------------------------
 
 
-DEFAULT_NORMALIZE_BLUR_RADIUS = 0.8
-
-
 @dataclass
 class NormalizationParams:
     target_dpi: int
     upscale_factor: float
-    base_blur_radius: float
-    blur_mode: str
+    blur_radius: float
 
 
 @dataclass
@@ -142,11 +139,13 @@ class MaskResult:
 logger = logging.getLogger("papercut_panel")
 
 
-def normalize_source_image(img: Image.Image, params: NormalizationParams) -> Tuple[Image.Image, float]:
+def normalize_source_image(
+    img: Image.Image, params: NormalizationParams
+) -> Tuple[Image.Image, float, float]:
     """Return a smoothed copy of the source image ready for mask extraction."""
 
-    if params.upscale_factor <= 1.0 and params.base_blur_radius <= 0:
-        return img.copy(), 1.0
+    if params.upscale_factor <= 1.0 and params.blur_radius <= 0:
+        return img.copy(), 1.0, 0.0
 
     upscale = max(1.0, float(params.upscale_factor))
 
@@ -158,7 +157,7 @@ def normalize_source_image(img: Image.Image, params: NormalizationParams) -> Tup
 
     w, h = img.size
     if w == 0 or h == 0:
-        return img.copy(), 1.0
+        return img.copy(), 1.0, 0.0
 
     target_w = max(1, int(round(w * upscale)))
     target_h = max(1, int(round(h * upscale)))
@@ -168,39 +167,21 @@ def normalize_source_image(img: Image.Image, params: NormalizationParams) -> Tup
     else:
         working = img.resize((target_w, target_h), resample=Resampling.LANCZOS)
 
-    effective_blur = 0.0
-    base_blur = max(0.0, float(params.base_blur_radius))
-    scale_used = target_w / float(w) if w else 1.0
-
-    if params.blur_mode == "fixed":
-        effective_blur = base_blur
-    elif params.blur_mode == "auto":
-        if scale_used <= 1.01:
-            effective_blur = 0.0
-        else:
-            if params.upscale_factor > 1.0:
-                denom = params.upscale_factor - 1.0
-                if denom > 0:
-                    scale_weight = min(1.0, max((scale_used - 1.0) / denom, 0.0))
-                else:
-                    scale_weight = 1.0
-            else:
-                scale_weight = min(1.0, max(scale_used - 1.0, 0.0))
-            effective_blur = base_blur * scale_weight
-            if dpi and params.target_dpi > 0:
-                src_dpi = max(dpi[0], dpi[1], 1)
-                if src_dpi >= params.target_dpi:
-                    effective_blur *= params.target_dpi / float(src_dpi)
-    else:
-        effective_blur = 0.0
-
-    if effective_blur > 0:
-        working = working.filter(ImageFilter.GaussianBlur(radius=effective_blur))
+    applied_blur = 0.0
+    if params.blur_radius > 0:
+        # Reduce smoothing when we already have sufficient resolution.
+        effective_scale = max(upscale, 1.0)
+        blur_radius = params.blur_radius / effective_scale
+        if dpi and params.target_dpi > 0 and dpi[0] >= params.target_dpi and dpi[1] >= params.target_dpi:
+            blur_radius = 0.0
+        if blur_radius >= 0.05:
+            working = working.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+            applied_blur = blur_radius
 
     if (target_w, target_h) != (w, h):
         working = working.resize((w, h), resample=Resampling.LANCZOS)
 
-    return working, upscale
+    return working, upscale, applied_blur
 
 
 def prepare_grayscale(gray: Image.Image, params: BWParams) -> Image.Image:
@@ -347,6 +328,44 @@ def connect_detail_gaps(mask: Image.Image, join_radius: int, *, smooth_radius: f
     return result
 
 
+def detect_relative_dark_regions(
+    gray_processed: Image.Image,
+    paper_candidate: Image.Image,
+    t_bg: int,
+    t_detail: int,
+) -> Image.Image:
+    """Detect locally dark regions that should become interior cut-outs."""
+
+    if paper_candidate.mode != "1":
+        paper_candidate = paper_candidate.convert("1")
+
+    if paper_candidate.getbbox() is None:
+        return Image.new("1", gray_processed.size, 0)
+
+    local_mean = gray_processed.filter(ImageFilter.BoxBlur(1))
+    local_min = gray_processed.filter(ImageFilter.MinFilter(size=3))
+    local_drop = ImageChops.subtract(local_mean, local_min)
+
+    relative_margin = max(6, (t_bg - t_detail) // 3)
+    rel_candidates = local_drop.point(lambda d: 255 if d >= relative_margin else 0, mode="1")
+
+    near_bg = gray_processed.point(lambda g: 255 if g < t_bg - 2 else 0, mode="1")
+    rel_candidates = ImageChops.logical_and(rel_candidates, near_bg)
+    rel_candidates = ImageChops.logical_and(rel_candidates, paper_candidate)
+
+    edge_map = gray_processed.filter(ImageFilter.FIND_EDGES)
+    edge_thresh = max(20, min(96, (t_bg - t_detail) * 2 + 16))
+    edge_mask = edge_map.point(lambda v: 255 if v >= edge_thresh else 0, mode="1")
+    edge_mask = ImageChops.logical_and(edge_mask, paper_candidate)
+    if edge_mask.getbbox() is not None:
+        edge_mask = _apply_closing(edge_mask, 1)
+        edge_regions = fill_closed_regions(edge_mask, dilation_radius=1)
+        rel_candidates = ImageChops.logical_and(rel_candidates, edge_regions)
+
+    rel_closed = _apply_closing(rel_candidates, 1)
+    return rel_closed
+
+
 def scale_radius(base_radius: int, scale_factor: float, *, exponent: float = 0.5, clamp: int | None = None) -> int:
     """Scale morphology radii sub-linearly to preserve fine details when upscaling."""
 
@@ -377,32 +396,10 @@ def build_masks_from_gray(gray_processed: Image.Image, params: BWParams) -> Mask
     holes_raw = gray_processed.point(lambda g: 255 if g < t_detail else 0, mode="1")
     holes_seed = ImageChops.logical_and(holes_raw, paper_candidate)
 
-    # Relative contrast-based seeding picks enclosed regions that are darker than
-    # their immediate surroundings even if they stay above the absolute
-    # threshold. This helps recover eyes/berries that sit inside brighter paper
-    # areas without punching through the background.
-    local_window = max(3, 2 * max(params.dilate_px, params.detail_join_px, 1) + 1)
-    local_max = gray_processed.filter(ImageFilter.MaxFilter(size=local_window))
-    local_min = gray_processed.filter(ImageFilter.MinFilter(size=local_window))
-    local_contrast = ImageChops.subtract(local_max, local_min)
-    relative_dark = ImageChops.subtract(local_max, gray_processed)
-
-    relative_thresh = max(8, int(round((t_bg - t_detail) * 0.75)))
-    contrast_thresh = max(relative_thresh * 2, 24)
-
-    relative_mask = relative_dark.point(lambda v: 255 if v >= relative_thresh else 0, mode="1")
-    contrast_mask = local_contrast.point(lambda v: 255 if v >= contrast_thresh else 0, mode="1")
-    relative_seed = ImageChops.logical_and(relative_mask, contrast_mask)
-    relative_seed = ImageChops.logical_and(relative_seed, paper_candidate)
-
-    seed_close_radius = 1 if params.detail_join_px > 0 else 0
-    if seed_close_radius > 0:
-        # Gently close thin gaps around the relative seed so it can flow
-        # through the same pipeline as the absolute threshold result without
-        # leaving bright rims around micro-edges.
-        relative_seed = _apply_closing(relative_seed, seed_close_radius)
-
-    holes_seed = ImageChops.logical_or(holes_seed, relative_seed)
+    # Relative darkness detector: treat locally dark pockets as potential cut-outs
+    holes_rel = detect_relative_dark_regions(gray_processed, paper_candidate, t_bg, t_detail)
+    if holes_rel.getbbox() is not None:
+        holes_seed = ImageChops.logical_or(holes_seed, holes_rel)
 
     hole_close_radius = params.dilate_px if params.dilate_px > 0 else 0
     holes_refined = _apply_closing(holes_seed, hole_close_radius)
@@ -414,7 +411,7 @@ def build_masks_from_gray(gray_processed: Image.Image, params: BWParams) -> Mask
 
     holes_combined = ImageChops.logical_or(holes_refined, detail_filled)
     join_radius = max(0, params.detail_join_px)
-    join_smooth = max(0.0, join_radius * 0.3)
+    join_smooth = max(0.0, join_radius * 0.35)
     holes_joined = connect_detail_gaps(holes_combined, join_radius, smooth_radius=join_smooth)
     holes_limited = ImageChops.logical_and(holes_joined, filled)
 
@@ -579,43 +576,19 @@ def build_white_on_gray_panel(
     logger.info("Resizing silhouette to %dx%d (scale %.3f)", new_w, new_h, scale_used)
 
     scale_factor = max(scale_used, 1.0)
-
-    min_bridge_mm = 1.0
-    min_bridge_px = max(1, mm_to_px(min_bridge_mm, layout.dpi))
-    # 1 mm minimum bridge translates to capping the closing radius at roughly half that width.
-    morph_cap_px = max(1, int(round(min_bridge_px / 2.0)))
-
-    dilate_cap_px = max(bw_params.dilate_px, morph_cap_px)
-    join_cap_px = max(bw_params.detail_join_px, morph_cap_px)
-
+    max_panel_dilate = mm_to_px(0.45, layout.dpi) if bw_params.dilate_px > 0 else 0
+    max_panel_join = mm_to_px(0.65, layout.dpi) if bw_params.detail_join_px > 0 else 0
     scaled_dilate = scale_radius(
         bw_params.dilate_px,
         scale_factor,
-        exponent=0.6,
-        clamp=dilate_cap_px,
+        exponent=0.45,
+        clamp=max_panel_dilate if max_panel_dilate > 0 else None,
     )
     scaled_join = scale_radius(
         bw_params.detail_join_px,
         scale_factor,
-        exponent=0.5,
-        clamp=join_cap_px,
-    )
-
-    bridge_cap_mm = morph_cap_px * MM_PER_INCH / layout.dpi
-    logger.info(
-        (
-            "Morphology scaling (scale=%.3f, 1mm bridge cap=%dpx ≈ %.2fmm): "
-            "dilate %d→%d (cap %dpx), detail_join %d→%d (cap %dpx)"
-        ),
-        scale_factor,
-        morph_cap_px,
-        bridge_cap_mm,
-        bw_params.dilate_px,
-        scaled_dilate,
-        dilate_cap_px,
-        bw_params.detail_join_px,
-        scaled_join,
-        join_cap_px,
+        exponent=0.35,
+        clamp=max_panel_join if max_panel_join > 0 else None,
     )
 
     scaled_params = BWParams(
@@ -628,14 +601,21 @@ def build_white_on_gray_panel(
     )
 
     gray_resized = processed_gray.resize((new_w, new_h), resample=Resampling.LANCZOS)
+    dilate_mm = (scaled_dilate / layout.dpi) * MM_PER_INCH if scaled_dilate > 0 else 0.0
+    join_mm = (scaled_join / layout.dpi) * MM_PER_INCH if scaled_join > 0 else 0.0
     logger.info(
-        "Building final masks at export scale (dilate=%d, detail_join=%d)",
+        "Building final masks at export scale (dilate=%d px / %.2f mm, detail_join=%d px / %.2f mm)",
         scaled_dilate,
+        dilate_mm,
         scaled_join,
+        join_mm,
     )
     final_masks = build_masks_from_gray(gray_resized, scaled_params)
 
     antialias = max(0.0, bw_params.antialias_radius * (scale_factor ** 0.5))
+    antialias_cap = mm_to_px(0.45, layout.dpi)
+    if antialias_cap > 0:
+        antialias = min(antialias, float(antialias_cap))
     logger.info("Applying antialias radius %.2f", antialias)
     mask_l = soften_mask(final_masks.paper, antialias)
 
@@ -728,10 +708,14 @@ def save_pptx_from_tiles(
     margin_px = mm_to_px(layout.margin_mm, layout.dpi)
     inner_w_px, inner_h_px = layout.tile_size_px
 
+    image_streams: List[BytesIO] = []
+
     for tile in tiles:
         slide = prs.slides.add_slide(prs.slide_layouts[6])
-        tmp_path = out_pptx.with_suffix(".tmp_tile.png")
-        tile.save(tmp_path, format="PNG")
+        buffer = BytesIO()
+        tile.save(buffer, format="PNG")
+        buffer.seek(0)
+        image_streams.append(buffer)
 
         tile_w_in = inner_w_px / layout.dpi
         tile_h_in = inner_h_px / layout.dpi
@@ -742,45 +726,12 @@ def save_pptx_from_tiles(
         width = Inches(tile_w_in)
         height = Inches(tile_h_in)
 
-        slide.shapes.add_picture(str(tmp_path), left, top, width=width, height=height)
-        tmp_path.unlink(missing_ok=True)
+        slide.shapes.add_picture(buffer, left, top, width=width, height=height)
 
     prs.save(out_pptx)
 
 
 # --------------------------- CLI ----------------------------
-
-
-def _interpret_normalize_blur(value: str) -> Tuple[str, float]:
-    raw = "" if value is None else str(value).strip()
-    text = raw.lower()
-
-    if text in {"", "auto", "adaptive"}:
-        return "auto", DEFAULT_NORMALIZE_BLUR_RADIUS
-
-    if text.startswith("auto:") or text.startswith("auto="):
-        _, _, tail = text.partition(":" if ":" in text else "=")
-        try:
-            radius = float(tail)
-        except ValueError as exc:  # pragma: no cover - defensive, CLI validated earlier
-            raise ValueError(f"Invalid --normalize-blur value: {value!r}") from exc
-        if radius < 0:
-            raise ValueError("Normalization blur radius must be non-negative")
-        return "auto", radius
-
-    if text in {"none", "no", "off"}:
-        return "none", 0.0
-
-    try:
-        radius = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"Invalid --normalize-blur value: {value!r}") from exc
-
-    if radius < 0:
-        raise ValueError("Normalization blur radius must be non-negative")
-    if radius == 0:
-        return "none", 0.0
-    return "fixed", radius
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -865,12 +816,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--normalize-blur",
-        type=str,
-        default="auto",
+        type=float,
+        default=0.8,
         help=(
-            "Normalization blur (default: auto). Use 'auto' for DPI-aware smoothing, "
-            "'auto:1.0' to tweak the base radius, 'none' to skip blur for fragile artwork, "
-            "or a numeric radius for a fixed blur."
+            "Baseline Gaussian blur radius used during normalization before adaptive scaling "
+            "(default: 0.8). Combine with --normalize-preset noblur to disable smoothing."
+        ),
+    )
+    p.add_argument(
+        "--normalize-preset",
+        choices=["default", "noblur"],
+        default="default",
+        help=(
+            "Normalization preset. 'default' applies adaptive smoothing; 'noblur' forces "
+            "zero blur regardless of other settings."
         ),
     )
     p.add_argument(
@@ -944,16 +903,14 @@ def main(argv=None) -> None:
         margin_mm=args.margin_mm,
     )
 
-    try:
-        blur_mode, blur_radius = _interpret_normalize_blur(args.normalize_blur)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
+    normalize_blur = max(0.0, float(args.normalize_blur))
+    if args.normalize_preset == "noblur":
+        normalize_blur = 0.0
 
     norm_params = NormalizationParams(
         target_dpi=max(0, int(args.normalize_dpi)),
         upscale_factor=max(1.0, float(args.normalize_scale)),
-        base_blur_radius=blur_radius,
-        blur_mode=blur_mode,
+        blur_radius=normalize_blur,
     )
 
     if args.flip_silhouette:
@@ -975,18 +932,12 @@ def main(argv=None) -> None:
 
     logger.info("Loading image: %s", inp)
     src_loaded = Image.open(inp).convert("RGB")
-    src, norm_scale = normalize_source_image(src_loaded, norm_params)
-    if norm_scale > 1.0 or norm_params.blur_mode != "none":
-        if norm_params.blur_mode == "none":
-            blur_desc = "off"
-        elif norm_params.blur_mode == "fixed":
-            blur_desc = f"fixed {norm_params.base_blur_radius:.2f}"
-        else:
-            blur_desc = f"auto {norm_params.base_blur_radius:.2f}"
+    src, norm_scale, norm_blur = normalize_source_image(src_loaded, norm_params)
+    if norm_scale > 1.0 or norm_blur > 0:
         logger.info(
-            "Source normalization applied (scale %.2f, blur %s)",
+            "Source normalization applied (scale %.2f, blur %.2f)",
             norm_scale,
-            blur_desc,
+            norm_blur,
         )
 
     panel, original_panel, auto_flipped = build_white_on_gray_panel(
