@@ -552,8 +552,44 @@ def build_white_on_gray_panel(
     logger.info("Resizing silhouette to %dx%d (scale %.3f)", new_w, new_h, scale_used)
 
     scale_factor = max(scale_used, 1.0)
-    scaled_dilate = scale_radius(bw_params.dilate_px, scale_factor, exponent=0.6, clamp=24)
-    scaled_join = scale_radius(bw_params.detail_join_px, scale_factor, exponent=0.5, clamp=18)
+
+    min_bridge_mm = 1.0
+    min_bridge_px = max(1, mm_to_px(min_bridge_mm, layout.dpi))
+    # 1 mm minimum bridge translates to capping the closing radius at roughly half that width.
+    morph_cap_px = max(1, int(round(min_bridge_px / 2.0)))
+
+    dilate_cap_px = max(bw_params.dilate_px, morph_cap_px)
+    join_cap_px = max(bw_params.detail_join_px, morph_cap_px)
+
+    scaled_dilate = scale_radius(
+        bw_params.dilate_px,
+        scale_factor,
+        exponent=0.6,
+        clamp=dilate_cap_px,
+    )
+    scaled_join = scale_radius(
+        bw_params.detail_join_px,
+        scale_factor,
+        exponent=0.5,
+        clamp=join_cap_px,
+    )
+
+    bridge_cap_mm = morph_cap_px * MM_PER_INCH / layout.dpi
+    logger.info(
+        (
+            "Morphology scaling (scale=%.3f, 1mm bridge cap=%dpx ≈ %.2fmm): "
+            "dilate %d→%d (cap %dpx), detail_join %d→%d (cap %dpx)"
+        ),
+        scale_factor,
+        morph_cap_px,
+        bridge_cap_mm,
+        bw_params.dilate_px,
+        scaled_dilate,
+        dilate_cap_px,
+        bw_params.detail_join_px,
+        scaled_join,
+        join_cap_px,
+    )
 
     scaled_params = BWParams(
         threshold_bg=bw_params.threshold_bg,
