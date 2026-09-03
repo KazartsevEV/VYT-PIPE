@@ -1,0 +1,61 @@
+name: VA10 Livy exact-source transport
+
+on:
+  push:
+    branches:
+      - chore/va10-livy-transport-20260903
+
+permissions:
+  contents: read
+
+jobs:
+  transport:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact frozen Perseus XML
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 2 \
+            'https://raw.githubusercontent.com/PerseusDL/canonical-latinLit/669d3657637ee44fb0aed2c37dd0f95c2b062193/data/phi0914/phi001/phi0914.phi001.perseus-lat2.xml' \
+            -o phi0914.phi001.perseus-lat2.xml
+
+      - name: Verify exact payload and compute SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p = Path('phi0914.phi001.perseus-lat2.xml')
+          data = p.read_bytes()
+          expected_size = 7_196_899
+          expected_blob = '853c18c08a84fc4c2d8f5c40f12e69d716ef853a'
+          if len(data) != expected_size:
+              raise SystemExit(f'size mismatch: {len(data)} != {expected_size}')
+          blob = hashlib.sha1(b'blob ' + str(len(data)).encode('ascii') + b'\0' + data).hexdigest()
+          if blob != expected_blob:
+              raise SystemExit(f'git blob mismatch: {blob} != {expected_blob}')
+          sha256 = hashlib.sha256(data).hexdigest()
+          Path('VA10_SOURCE_SHA256.txt').write_text(
+              f'file=phi0914.phi001.perseus-lat2.xml\n'
+              f'size={len(data)}\n'
+              f'git_blob_sha1={blob}\n'
+              f'sha256={sha256}\n'
+              f'source_commit=669d3657637ee44fb0aed2c37dd0f95c2b062193\n',
+              encoding='utf-8')
+          print(f'size={len(data)}')
+          print(f'git_blob_sha1={blob}')
+          print(f'sha256={sha256}')
+          PY
+
+      - name: Upload exact source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: va10-livy-exact-source
+          path: |
+            phi0914.phi001.perseus-lat2.xml
+            VA10_SOURCE_SHA256.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
